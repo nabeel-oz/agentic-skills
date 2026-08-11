@@ -4,7 +4,7 @@ description: "Write, complete, or extend Qlik Sense load scripts (.qvs) for data
 license: Apache-2.0
 metadata:
   author: nabeel-oz
-  version: 1.0.0
+  version: 1.5.0
   tags:
     - qlik
     - load-script
@@ -23,238 +23,113 @@ metadata:
 
 You are writing **Qlik Sense load script** (.qvs files) for data preparation. You have **no access to live data or a Qlik Cloud environment** — you cannot execute, preview, or validate a script against the Qlik engine. Produce correct, clean, well-commented script that runs with minimal edits.
 
-**Built for coding agents.** This skill is designed primarily for agentic coding tools with file-system access — Claude Code, Cursor, Windsurf, and similar — working inside a project that contains `.qvs` files:
+**Built for coding agents.** This skill is designed primarily for agentic coding tools with file-system access — Claude Code, Cursor, Codex, and similar — working inside a project that contains `.qvs` files:
 - Read the existing script(s) from disk (via your file-read tool) before editing.
 - Edit or create the `.qvs` file(s) directly in the project rather than only printing script into the chat.
 - Preserve the surrounding project structure (other tabs, connections, file layout) exactly as found, except where the task asks you to change it.
 
-If you are running in a chat-only environment with no file access (e.g. a plain web chat), fall back to outputting complete script blocks for the user to copy and paste — see [Response Format](#response-format).
+If you are running in a chat-only environment with no file access (e.g. a plain web chat), fall back to outputting complete script blocks for the user to copy and paste — see [Workflow](#workflow).
 
-**Primary use case:** Data preparation scripts for ML experiments using Qlik Predict. The user provides a starting script with base data. You transform, engineer features, and output training/testing QVD files.
+**Primary use case:** Data preparation scripts for ML experiments using Qlik Predict. The user provides a starting script with base data. You transform, engineer features, and output training/testing QVD files. All guidance for this — target requirements, split patterns, leakage checks, script template — is in [references/ml-data-prep.md](references/ml-data-prep.md).
 
 **General use case:** Complete or extend any Qlik load script based on starting code, inline comments, and the user's prompt.
 
 ## Critical Rules
 
 1. **This is Qlik load script, not SQL.** The syntax resembles SQL but differs in important ways. When unsure, read [references/syntax-and-patterns.md](references/syntax-and-patterns.md) and consult: https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/LoadData/script-syntax-functions.htm
-2. **Never invent functions.** If you are not confident a built-in function exists, say so and suggest an alternative you are confident about.
+2. **Never invent functions or guess arguments.** If you are not confident a built-in function exists, check the Help docs, search Qlik Community, and use an approach you are confident about.
 3. **No execution.** You cannot run or test the script against Qlik Cloud, regardless of environment. Flag anything you are uncertain about with a `// TODO: verify` comment so the user can check.
 4. **Preserve the user's starting script.** Do not rewrite or restructure parts of the script the user did not ask you to change.
-5. **Output complete, runnable script.** Do not output partial snippets with "..." elisions unless the user explicitly asks for a diff. When you have file access, write the complete section back to the `.qvs` file; when outputting to chat, the user is copy-pasting into the Qlik Cloud script editor.
+5. **Output complete, runnable script.** Do not output partial snippets with "..." elisions unless the user explicitly asks for a diff. When you have file access, write the complete section back to the `.qvs` file; when outputting to chat, assume the user is copy-pasting into the Qlik Cloud script editor.
 
 **Before writing any Qlik script**, read [references/syntax-and-patterns.md](references/syntax-and-patterns.md) for the full syntax reference, common pitfalls, and code patterns. This is essential — Qlik syntax has many subtle differences from SQL that cause silent bugs if you rely on SQL intuition.
 
----
+### Non-negotiable syntax rules
 
-## ML Data Preparation Guidelines
+These five account for the majority of observed failures. They are all cases where SQL intuition produces script that either will not parse or is silently wrong. **Verify each one explicitly before returning any script** — do not rely on having "written it carefully".
 
-### Common data sources
-Starting scripts typically load from **CSV** or **QVD** files via `lib://` connections. Match the source format and lib path used in the starting script. When loading CSV files, always specify the format explicitly:
-```qlik
-FROM [lib://DataFiles/data.csv] (txt, codepage is utf8, embedded labels, delimiter is ',');
-```
+1. **No `Count(*)`.** It is a syntax error. Use `Count(1)` to count all rows, `Count(FieldName)` to count non-null values of a field, `Count(DISTINCT FieldName)` for unique values, and `Sum(If(cond, 1, 0))` for a conditional count. `Count(1)` and `Count(Field)` differ by the number of nulls — choose deliberately, because the difference silently changes any ratio built on top.
 
-### Feature engineering philosophy
-Apply your **data science and ML knowledge** to engineer features that are likely to have genuine predictive signal for the specific use case. Aim for impact over exhaustiveness — a focused set of well-reasoned features is better than a sprawling feature matrix that adds noise. Consider domain context, known drivers from the literature, and the business logic behind the prediction task when choosing what to derive.
+2. **An alias cannot be used in the LOAD that creates it.** Per Qlik's docs, *"fields created through the `as` clause are out of scope and cannot be used inside the same load statement."* If field B is derived from field A, and A is created in this LOAD, they must be in **separate** LOADs — a preceding LOAD (stacked, executes bottom-up) or a `RESIDENT` step. Build calculation chains in explicit steps.
 
-### Output structure for Qlik Predict
-Qlik Predict expects a **flat, single-table dataset**:
-- One row = one observation at the defined grain (e.g., one customer, one loan, one month-region).
-- One column = the **target** (what you are predicting).
-- Remaining columns = **features** (inputs to the model).
-- Supported output: QVD (preferred), CSV, XLSX, Parquet.
+3. **Assume auto-concatenation unless explicitly ruled out.** Any LOAD whose field set matches an earlier table is silently appended to that table and **your table label is never created** — every later `RESIDENT`, `DROP TABLE`, `STORE`, or `JOIN (…)` on that name then fails at reload. The trigger is matching field names and count, not the table name or the data, so `LOAD * RESIDENT X` into a new name is always a candidate. Put `NoConcatenate` on every such LOAD (label first, then `NoConcatenate`, then `LOAD`). Before writing any table reference, name the LOAD that created it and confirm it survived under that name.
 
-### Target column requirements
-| Experiment Type | Target Requirement |
-|---|---|
-| Binary classification | Exactly 2 unique values (e.g., `Yes`/`No`, `1`/`0`, `Churn`/`Active`) |
-| Multiclass classification | 3–10 unique categorical values |
-| Regression | Numeric with >10 unique values |
-| Time series | Numeric target + date index column + optional group columns (max 2) |
+4. **No `HAVING`.** It does not exist in Qlik. To filter on an aggregate, aggregate in one LOAD and filter in a **second** pass — a preceding LOAD with `WHERE`, or a `RESIDENT` reload. A `WHERE` on a LOAD filters input rows *before* aggregation and cannot contain aggregation functions.
 
-### Feature count and field retention guidance
-- **Aim for impactful features** without overcomplicating the feature matrix. Focus on features with clear predictive signal rather than exhaustively deriving every possible combination. Use your data science and ML knowledge to prioritise features that are likely to matter for the specific use case.
-- **Always retain ID/key fields** (e.g., CustomerID, LoanID, PolicyNumber). These are not used as features during training, but they are essential for linking predictions back to the original data after model deployment. Qlik Predict will ignore high-cardinality identifiers automatically — keeping them in the dataset does no harm.
-- Remove fields that are direct derivatives or consequences of the target (leakage).
+5. **`Round()`'s second argument is a step (interval), not a number of decimal places.** `Round(x, 3)` rounds to multiples of 3. For 2 decimals use `Round(x, 0.01)`; for 3, `Round(x, 0.001)` — for *N* decimals the step is `1/10^N`, always less than 1. Same for `Ceil()` and `Floor()`. If you have written a step ≥ 1, confirm you meant to bucket. For ML features, prefer not rounding at all — it discards signal.
 
-### Date format convention
-Date fields should be stored in **YYYY-MM-DD** format (ISO 8601) for reliability across Qlik environments. Qlik Predict automatically derives date dimensions (year, month, day of week, quarter, etc.) from fields it profiles as dates, so you generally do **not** need to manually decompose dates into separate year/month/day columns. Focus manual date engineering on features Qlik Predict cannot auto-derive: date differences, durations, and domain-specific periods.
-
-```qlik
-// Format dates as YYYY-MM-DD for reliable interpretation
-Date(Date#(RawDateField, 'DD/MM/YYYY'), 'YYYY-MM-DD') as EventDate,
-// Manual date engineering — only for features Qlik Predict won't auto-derive
-Today() - Date#(RawDateField, 'DD/MM/YYYY') as DaysSinceEvent
-```
-
-### Train/Test split approaches
-
-The split produces a **held-out validation set** that simulates real-world unseen data after model training and deployment — critical for POC credibility. Qlik Predict handles its own internal cross-validation and evaluation metrics during training; the test set you create here is a separate, external validation asset. Choose the approach that fits the use case.
-
-**Approach 1 — Random split (default for most use cases)**
-```qlik
-// Random 80/20 split (non-deterministic across reloads)
-
-WithSplit:
-LOAD
-    *,
-    If(Rand() <= 0.8, 'Train', 'Test') as SplitFlag
-RESIDENT FinalFeatures;
-
-DROP TABLE FinalFeatures;
-
-// Store separately
-Training:
-NoConcatenate
-LOAD * RESIDENT WithSplit WHERE SplitFlag = 'Train';
-DROP FIELD SplitFlag FROM Training;
-STORE Training INTO [lib://DataFiles/training_data.qvd] (qvd);
-DROP TABLE Training;
-
-Testing:
-NoConcatenate
-LOAD * RESIDENT WithSplit WHERE SplitFlag = 'Test';
-DROP FIELD SplitFlag FROM Testing;
-STORE Testing INTO [lib://DataFiles/testing_data.qvd] (qvd);
-DROP TABLE Testing;
-
-DROP TABLE WithSplit;
-```
-
-**Approach 2 — Time-based split (when temporal ordering matters)**
-
-Use this when the prediction task is inherently time-dependent (e.g., forecasting, next-month churn, seasonal risk). Splitting on time prevents future data from leaking into the training set and better simulates production conditions.
-```qlik
-// Split on a date threshold — all data before cutoff = Train, after = Test
-LET vCutoffDate = Num(MakeDate(2025, 1, 1));
-
-Training:
-NoConcatenate
-LOAD * RESIDENT FinalFeatures
-WHERE ObservationDate < $(vCutoffDate);
-STORE Training INTO [lib://DataFiles/training_data.qvd] (qvd);
-DROP TABLE Training;
-
-Testing:
-NoConcatenate
-LOAD * RESIDENT FinalFeatures
-WHERE ObservationDate >= $(vCutoffDate);
-STORE Testing INTO [lib://DataFiles/testing_data.qvd] (qvd);
-DROP TABLE Testing;
-
-DROP TABLE FinalFeatures;
-```
-
-### Target leakage checklist
-Before finalizing any ML prep script, verify:
-- [ ] No field is a direct consequence of the target (e.g., `Cancellation_Date` when predicting churn).
-- [ ] No field is populated only after the event being predicted.
-- [ ] Lag/window features exclude the current row (offsets start at -1 or earlier).
-- [ ] No aggregation inadvertently includes future data.
-- [ ] Ask: **"Would I know this value at the moment I need to make the prediction?"**
-
-### Class imbalance (binary classification)
-If the minority class is <20% of rows, flag this in a comment and suggest:
-1. Redefining the target window (broaden the positive class definition).
-2. Undersampling the majority class via `Rand()`.
-3. Oversampling the minority class via `CONCATENATE`.
-4. Letting Qlik Predict's intelligent optimization handle auto-balancing (works for moderate imbalance, 5–20%).
-
-### Final cleanup checklist
-Before outputting the final script:
-- [ ] All temporary/intermediate tables are `DROP`ped.
-- [ ] ID/key fields are retained for linking predictions back to source data. Only drop temporary helper columns.
-- [ ] The target column is clearly identified in a comment.
-- [ ] Field names are descriptive (no raw abbreviations unless domain-standard).
-- [ ] Null handling is explicit for critical fields.
-- [ ] STORE path defaults to `lib://DataFiles/...` unless the starting script uses a different lib connection — match it.
-- [ ] Script includes a header comment block with: purpose, target field, grain, date generated.
+**Then run the self-check** in [§14 of the reference](references/syntax-and-patterns.md#14-sql-habits-that-break-in-qlik), which also lists the wider set of SQL constructs that do not exist in Qlik (`ON` clauses, subqueries, CTEs, `CASE`, `UNION`, `COALESCE`, `LIMIT`, `OVER (PARTITION BY …)`, `%`, `+` for strings).
 
 ---
 
-## Script Template
+## Commenting Style
 
-When generating a new ML prep script from scratch, use this structure:
+Write comments as an experienced Qlik developer would for colleagues who will maintain this script — not as a narration of your own work. The reader is a competent Qlik developer: they can read `LOAD`, `RESIDENT`, and `Sum()`. What they cannot recover from the code is **why**.
+
+**Where comments belong**
+- **Header block** (top of the script) — purpose, target/grain if ML, source data, owner.
+- **Start of each `///$tab`** — one or two lines on what this section produces and why it exists.
+- **Start of each logical block** (a table build, a join sequence, an aggregation) — the intent and any non-obvious logic or business rule behind it.
+- **Individual lines** — only where there is a genuine point to make: a business rule or threshold and its rationale, a workaround with its reason, a non-obvious function argument, a unit or grain that isn't apparent, or a field description that saves the reader cross-referencing another part of the script. Deriving a field whose meaning isn't obvious from its name is a good reason; `// Load the customers table` is not.
+
+**Register and length**
+- Succinct and factual. One line where one line does. Full sentences are fine; paragraphs should be avoided.
+- Explain **why**, not **what**. If a comment restates the code, delete it.
+- No emoji, no decorative ASCII beyond the existing section banners, no enthusiasm, no hedging.
+- Prefer the imperative or plain declarative: `// Exclude staff accounts — they distort the churn base rate.`
+
+**Comments must not accumulate**
+This is the failure mode to guard against hardest. When you revise a script:
+- **Edit the existing comment to describe the new state.** Do not append a correction, a "fixed:" note, a "previously we…", or a second comment beside the first.
+- **Delete comments describing code you removed.** A comment surviving its code is worse than no comment.
+- **Never leave development history inline** — no `// changed 2026-08-11`, no `// was Count(*), now Count(1)`, no commented-out previous versions, no bug narration. The comment describes the code as it stands, in the present tense, as though written once.
+- Ask of every comment you leave behind: *would a developer seeing this file for the first time, with no knowledge of its revision history, find this useful?* If not, it goes.
+
+**Change log**
+For complex or long-lived scripts, keep revision history in a dedicated `///$tab Change Log` placed early in the script (immediately after `Main`), not scattered through the code:
 
 ```qlik
-///$tab Main
+///$tab Change Log
 /**
- * ML Data Preparation Script
- * Purpose:     [describe the prediction task]
- * Target:      [field name] ([binary/regression/multiclass/time series])
- * Grain:       One row per [entity]
- * Generated:   [date]
- * Source data: [describe inputs]
+ * 2026-08-11  NK  Added policy tenure and claims-frequency features.
+ * 2026-07-02  NK  Switched split to time-based on RenewalDate (was random).
+ * 2026-06-18  NK  Initial version.
  */
-
-///$tab Config
-// ============================================================
-// CONFIGURATION
-// ============================================================
-SET vOutputPath = 'lib://DataFiles';  // Default — use the lib path from the starting script if different
-LET vToday = Today();
-// LET vCutoffDate = Num(MakeDate(2025, 1, 1));  // Uncomment for time-based split
-
-///$tab Source Data
-// ============================================================
-// LOAD SOURCE DATA
-// ============================================================
-// [Load base tables from QVDs or other sources]
-
-///$tab Feature Engineering
-// ============================================================
-// FEATURE ENGINEERING
-// ============================================================
-// [Aggregation, derived fields, joins, enrichment]
-
-///$tab Final Assembly
-// ============================================================
-// ASSEMBLE FINAL DATASET
-// ============================================================
-// [Combine all features into one flat table]
-// [Drop helper tables]
-// [Drop leaky or unnecessary fields]
-
-///$tab Output
-// ============================================================
-// STORE OUTPUT
-// ============================================================
-// [Train/test split if applicable]
-// [STORE to QVD]
-// [DROP final tables]
 ```
 
-> **Note on `///$tab` comments:** These are Qlik script section markers. They create named tabs in the Qlik Cloud script editor. Use them to organize long scripts into logical sections.
+Add an entry here when making a substantive change to an existing script that already has this tab; create the tab when a script grows past a handful of tabs or when the user asks for one. Short scripts do not need it — do not add ceremony to a 30-line script.
+
+**`// TODO: verify` notes** are the exception to all of the above: they are temporary, must state the reason, and the user removes them once checked.
 
 ---
 
-## Response Format
+## Workflow
 
 When the user provides a starting script or prompt:
 
-1. **Understand the task.** State back the prediction target, grain, and key transformations needed. Ask clarifying questions if the intent is ambiguous.
-2. **Write the script.** If you have file access (Claude Code, Cursor, etc.), edit or create the `.qvs` file(s) directly. Otherwise, output complete, runnable Qlik load script sections in the chat. Use comments liberally.
-3. **Flag uncertainties.** Mark anything you are not 100% sure about with `// TODO: verify — [reason]`.
-4. **Explain non-obvious logic.** After the script block, briefly explain any complex Window() calls, tricky joins, or domain-specific choices.
-5. **Suggest improvements.** If you see opportunities for additional features, better handling of nulls/outliers, or potential leakage risks, mention them after the main output.
-
----
-
-## Example
-
-**User prompt:**
-> "I have `lib://DataFiles/transactions.qvd` (one row per transaction: `CustomerID`, `TransactionDate`, `Amount`, `ProductCategory`, `Returned`) and `lib://DataFiles/customers.qvd` (one row per customer: `CustomerID`, `SignupDate`, `Region`). Build an ML prep script that predicts whether a customer cancels (`CancellationDate` is populated) in the next 90 days. Output training/testing QVDs."
-
-**Expected response:**
-1. State back the task: target = binary flag derived from `CancellationDate` (leaky field to drop after deriving the target), grain = one row per customer, source = the two QVDs above.
-2. Write a script (following the [Script Template](#script-template)) that: loads both QVDs, aggregates `transactions` to customer grain (`TxnCount`, `TotalSpend`, `AvgSpend`, `Recency_Days`, `Count(DISTINCT ProductCategory)`, return rate — see [Feature Engineering Patterns](references/syntax-and-patterns.md#13-feature-engineering-patterns)), joins onto `customers`, derives `Churn_Flag` from `CancellationDate` then drops `CancellationDate` itself (leakage), applies the random 80/20 split from [Train/Test split approaches](#train-test-split-approaches), and stores `training_data.qvd` / `testing_data.qvd`.
-3. Flag any uncertain function calls with `// TODO: verify`, and call out the leakage check (`CancellationDate` removed) explicitly after the script.
+1. **Load the right reference(s).** Always read [references/syntax-and-patterns.md](references/syntax-and-patterns.md) before writing script. If the task is preparing data for a **Qlik Predict** experiment, also read [references/ml-data-prep.md](references/ml-data-prep.md) — it holds the target requirements, feature-engineering and leakage guidance, train/test split patterns, the explicit feature-matrix and Feature Definitions QVD requirements, script template, and final cleanup checklist.
+2. **Understand the task.** For ML prep, state back the prediction target, grain, and key transformations. Ask clarifying questions only if the intent is genuinely ambiguous.
+3. **Read the existing script(s) from disk** before editing, and note the lib connection paths and source formats already in use — match them.
+4. **Track the tables.** As you write, keep a running inventory of every table: its name, its field set, whether it carries `NoConcatenate`, and where it is dropped. Consult it before every `RESIDENT`, `JOIN`, `STORE`, or `DROP` rather than assuming the name you wrote earlier exists. Two live tables with the same field set means one of them has been auto-concatenated away.
+5. **Write the script.** With file access, edit or create the `.qvs` file(s) directly. Otherwise output complete, runnable sections in the chat. Comment per the [commenting style](#commenting-style) above.
+6. **Re-read what you wrote and run the self-check** from [§14 of the syntax reference](references/syntax-and-patterns.md#14-sql-habits-that-break-in-qlik). Since you cannot execute the script, this pass is the only validation it gets — treat it as required, not optional. Check the script as written on disk, not your memory of writing it. In the same pass, re-read the comments: delete any that restate the code, describe code you removed, or narrate the revision you just made.
+7. **Flag uncertainties** with `// TODO: verify — [reason]`.
+8. **Explain non-obvious logic** after the script: complex `Window()` calls, tricky joins, domain-specific choices.
+9. **Suggest improvements** — additional features, null/outlier handling, leakage risks.
 
 ---
 
 ## Reference
 
-- **Syntax & patterns reference:** [references/syntax-and-patterns.md](references/syntax-and-patterns.md) — full Qlik load script syntax, common pitfalls, and feature engineering code patterns. **Read this before writing any script.**
+### Bundled references
+- **[references/syntax-and-patterns.md](references/syntax-and-patterns.md)** — full Qlik load script syntax, common pitfalls, feature engineering code patterns, and the SQL-habits self-check (§14). **Read before writing any script.**
+- **[references/ml-data-prep.md](references/ml-data-prep.md)** — Qlik Predict target requirements, feature/field retention guidance, date conventions, explicit feature matrix, Feature Definitions QVD, train/test split patterns, leakage and class-imbalance checks, script template, final cleanup checklist, worked example. **Read for any Qlik Predict data prep task.**
+
+### Qlik documentation
 - **Qlik Script Syntax & Functions:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/LoadData/script-syntax-functions.htm
 - **Qlik Predict documentation:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/AutoML/home-automl.htm
 - **Window function reference:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/LoadData/window-functions.htm
+- **LOAD statement (authoritative clause list; alias scope rule):** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/ScriptRegularStatements/Load.htm
+- **Count():** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/BasicAggregationFunctions/Count.htm
+- **Round():** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/NumericFunctions/round.htm
+- **NoConcatenate / automatic concatenation:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/ScriptPrefixes/NoConcatenate.htm
