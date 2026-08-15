@@ -4,7 +4,7 @@ description: "Write, complete, or extend Qlik Sense load scripts (.qvs) for data
 license: Apache-2.0
 metadata:
   author: nabeel-oz
-  version: 1.5.0
+  version: 1.6.0
   tags:
     - qlik
     - load-script
@@ -42,23 +42,21 @@ If you are running in a chat-only environment with no file access (e.g. a plain 
 4. **Preserve the user's starting script.** Do not rewrite or restructure parts of the script the user did not ask you to change.
 5. **Output complete, runnable script.** Do not output partial snippets with "..." elisions unless the user explicitly asks for a diff. When you have file access, write the complete section back to the `.qvs` file; when outputting to chat, assume the user is copy-pasting into the Qlik Cloud script editor.
 
-**Before writing any Qlik script**, read [references/syntax-and-patterns.md](references/syntax-and-patterns.md) for the full syntax reference, common pitfalls, and code patterns. This is essential — Qlik syntax has many subtle differences from SQL that cause silent bugs if you rely on SQL intuition.
+**Before writing any Qlik script**, read [references/writing-scripts.md](references/writing-scripts.md) (how to build it) and [references/syntax-and-patterns.md](references/syntax-and-patterns.md) (the syntax itself and the code patterns). Both are essential — Qlik syntax has many subtle differences from SQL that cause silent bugs if you rely on SQL intuition, and construction failures are invisible until reload.
 
 ### Non-negotiable syntax rules
 
-These five account for the majority of observed failures. They are all cases where SQL intuition produces script that either will not parse or is silently wrong. **Verify each one explicitly before returning any script** — do not rely on having "written it carefully".
+These five are the majority of observed syntax failures: SQL intuition either will not parse or is silently wrong. The correct forms and examples live in the syntax reference — do not skip it. The lines below are the **check**, not the teaching. Confirm each one against the script before returning it.
 
-1. **No `Count(*)`.** It is a syntax error. Use `Count(1)` to count all rows, `Count(FieldName)` to count non-null values of a field, `Count(DISTINCT FieldName)` for unique values, and `Sum(If(cond, 1, 0))` for a conditional count. `Count(1)` and `Count(Field)` differ by the number of nulls — choose deliberately, because the difference silently changes any ratio built on top.
+1. **No `Count(*)`.** Use `Count(1)` for all rows, `Count(Field)` for non-nulls. ([syntax §6](references/syntax-and-patterns.md#6-key-functions))
+2. **An alias cannot be used in the LOAD that creates it.** Split into a preceding LOAD or a `RESIDENT` step. ([syntax §2](references/syntax-and-patterns.md#2-load-statement-patterns))
+3. **Assume auto-concatenation unless ruled out.** Matching field names silently discard your table label. `NoConcatenate` on every such LOAD — label, then prefix, then `LOAD`. ([syntax §4](references/syntax-and-patterns.md#4-concatenate))
+4. **No `HAVING`.** Aggregate, then filter with `WHERE` in a second pass. ([syntax §5](references/syntax-and-patterns.md#5-where-group-by-order-by))
+5. **`Round(x, 2)` is not 2 decimal places.** The second argument is a step: `Round(x, 0.01)`. Same for `Ceil()` and `Floor()`. ([syntax §6](references/syntax-and-patterns.md#6-key-functions))
 
-2. **An alias cannot be used in the LOAD that creates it.** Per Qlik's docs, *"fields created through the `as` clause are out of scope and cannot be used inside the same load statement."* If field B is derived from field A, and A is created in this LOAD, they must be in **separate** LOADs — a preceding LOAD (stacked, executes bottom-up) or a `RESIDENT` step. Build calculation chains in explicit steps.
+**Then run the self-check** in [references/verification-checklist.md](references/verification-checklist.md).
 
-3. **Assume auto-concatenation unless explicitly ruled out.** Any LOAD whose field set matches an earlier table is silently appended to that table and **your table label is never created** — every later `RESIDENT`, `DROP TABLE`, `STORE`, or `JOIN (…)` on that name then fails at reload. The trigger is matching field names and count, not the table name or the data, so `LOAD * RESIDENT X` into a new name is always a candidate. Put `NoConcatenate` on every such LOAD (label first, then `NoConcatenate`, then `LOAD`). Before writing any table reference, name the LOAD that created it and confirm it survived under that name.
-
-4. **No `HAVING`.** It does not exist in Qlik. To filter on an aggregate, aggregate in one LOAD and filter in a **second** pass — a preceding LOAD with `WHERE`, or a `RESIDENT` reload. A `WHERE` on a LOAD filters input rows *before* aggregation and cannot contain aggregation functions.
-
-5. **`Round()`'s second argument is a step (interval), not a number of decimal places.** `Round(x, 3)` rounds to multiples of 3. For 2 decimals use `Round(x, 0.01)`; for 3, `Round(x, 0.001)` — for *N* decimals the step is `1/10^N`, always less than 1. Same for `Ceil()` and `Floor()`. If you have written a step ≥ 1, confirm you meant to bucket. For ML features, prefer not rounding at all — it discards signal.
-
-**Then run the self-check** in [§14 of the reference](references/syntax-and-patterns.md#14-sql-habits-that-break-in-qlik), which also lists the wider set of SQL constructs that do not exist in Qlik (`ON` clauses, subqueries, CTEs, `CASE`, `UNION`, `COALESCE`, `LIMIT`, `OVER (PARTITION BY …)`, `%`, `+` for strings).
+The five rules stop the script from *breaking*. A separate class of failure leaves it running cleanly while producing the wrong answer — a field destroyed by an intermediate `LOAD`, a table left alive by an include, `TRACE` printing an expression, `FirstSortedValue()` returning NULL on ties. Construction is [writing-scripts.md](references/writing-scripts.md) (read it **before the first `LOAD`**); the `FirstSortedValue()` trap is [syntax §6](references/syntax-and-patterns.md#6-key-functions).
 
 ---
 
@@ -107,12 +105,14 @@ Add an entry here when making a substantive change to an existing script that al
 
 When the user provides a starting script or prompt:
 
-1. **Load the right reference(s).** Always read [references/syntax-and-patterns.md](references/syntax-and-patterns.md) before writing script. If the task is preparing data for a **Qlik Predict** experiment, also read [references/ml-data-prep.md](references/ml-data-prep.md) — it holds the target requirements, feature-engineering and leakage guidance, train/test split patterns, the explicit feature-matrix and Feature Definitions QVD requirements, script template, and final cleanup checklist.
-2. **Understand the task.** For ML prep, state back the prediction target, grain, and key transformations. Ask clarifying questions only if the intent is genuinely ambiguous.
-3. **Read the existing script(s) from disk** before editing, and note the lib connection paths and source formats already in use — match them.
-4. **Track the tables.** As you write, keep a running inventory of every table: its name, its field set, whether it carries `NoConcatenate`, and where it is dropped. Consult it before every `RESIDENT`, `JOIN`, `STORE`, or `DROP` rather than assuming the name you wrote earlier exists. Two live tables with the same field set means one of them has been auto-concatenated away.
-5. **Write the script.** With file access, edit or create the `.qvs` file(s) directly. Otherwise output complete, runnable sections in the chat. Comment per the [commenting style](#commenting-style) above.
-6. **Re-read what you wrote and run the self-check** from [§14 of the syntax reference](references/syntax-and-patterns.md#14-sql-habits-that-break-in-qlik). Since you cannot execute the script, this pass is the only validation it gets — treat it as required, not optional. Check the script as written on disk, not your memory of writing it. In the same pass, re-read the comments: delete any that restate the code, describe code you removed, or narrate the revision you just made.
+Load references by phase: construction and syntax before writing, verification after, ML prep only for Qlik Predict tasks.
+
+1. **Load the right reference(s).** Read [references/writing-scripts.md](references/writing-scripts.md) and [references/syntax-and-patterns.md](references/syntax-and-patterns.md) before writing script. If the task is preparing data for a **Qlik Predict** experiment, also read [references/ml-data-prep.md](references/ml-data-prep.md) — it holds the target requirements, feature-engineering and leakage guidance, train/test split patterns, the explicit feature-matrix and Feature Definitions QVD requirements, script template, and final cleanup checklist.
+2. **Understand the task, then design the target.** For ML prep, state back the prediction target, grain, and key transformations. Ask clarifying questions only if the intent is genuinely ambiguous. **Before writing any `LOAD`, write down the final table's grain and field list**, then work backwards to the source fields each one needs — see [writing-scripts §1](references/writing-scripts.md#1-design-the-target-data-model-first). Every step you then write should move the data measurably closer to that target.
+3. **Read the existing script(s) from disk** before editing, and note the lib connection paths and source formats already in use — match them. If the script uses `$(Include=…)`, read the included file too: its tables live in the same namespace.
+4. **Track the tables.** As you write, keep a running inventory of every table: its **name**, its **field set**, whether it carries **`NoConcatenate`**, and its **drop point**. Consult it before every `RESIDENT`, `JOIN`, `STORE`, or `DROP` rather than assuming the name you wrote earlier exists. Two live tables with the same field set means one of them has been auto-concatenated away. A table with no drop point recorded is either the final output or an oversight.
+5. **Write the script.** With file access, edit or create the `.qvs` file(s) directly. Otherwise output complete, runnable sections in the chat. Comment per the [commenting style](#commenting-style) above, and add `TRACE` checkpoints at the points where a silent error would otherwise be invisible — after each `STORE`, each split, and each join that could fan out ([writing-scripts §3](references/writing-scripts.md#3-tracing-and-progress-output)).
+6. **Re-read what you wrote and run the self-check** in [references/verification-checklist.md](references/verification-checklist.md). Since you cannot execute the script, this pass is the only validation it gets — treat it as required, not optional. Check the script as written on disk, not your memory of writing it. In the same pass, re-read the comments: delete any that restate the code, describe code you removed, or narrate the revision you just made.
 7. **Flag uncertainties** with `// TODO: verify — [reason]`.
 8. **Explain non-obvious logic** after the script: complex `Window()` calls, tricky joins, domain-specific choices.
 9. **Suggest improvements** — additional features, null/outlier handling, leakage risks.
@@ -122,8 +122,15 @@ When the user provides a starting script or prompt:
 ## Reference
 
 ### Bundled references
-- **[references/syntax-and-patterns.md](references/syntax-and-patterns.md)** — full Qlik load script syntax, common pitfalls, feature engineering code patterns, and the SQL-habits self-check (§14). **Read before writing any script.**
-- **[references/ml-data-prep.md](references/ml-data-prep.md)** — Qlik Predict target requirements, feature/field retention guidance, date conventions, explicit feature matrix, Feature Definitions QVD, train/test split patterns, leakage and class-imbalance checks, script template, final cleanup checklist, worked example. **Read for any Qlik Predict data prep task.**
+
+Organised by **when** they are read, so each phase loads only what it needs:
+
+| Reference | Phase | Contents |
+|---|---|---|
+| **[references/writing-scripts.md](references/writing-scripts.md)** | Before the first `LOAD` | Designing the target data model and building towards it, table lifecycle and drop discipline (including `$(Include=…)` namespace hazards), `TRACE` checkpoints, and when to prototype in Python first. |
+| **[references/syntax-and-patterns.md](references/syntax-and-patterns.md)** | While writing | Full Qlik load script syntax, the function reference, and feature-engineering code patterns. |
+| **[references/verification-checklist.md](references/verification-checklist.md)** | After writing, and after every revision | Common pitfalls table, SQL-habits table, and the numbered self-check. |
+| **[references/ml-data-prep.md](references/ml-data-prep.md)** | Qlik Predict tasks only | Target requirements, feature/field retention guidance, date conventions, explicit feature matrix, Feature Definitions QVD, train/test split patterns, leakage and class-imbalance checks, script template, final cleanup checklist, worked example. |
 
 ### Qlik documentation
 - **Qlik Script Syntax & Functions:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/LoadData/script-syntax-functions.htm
@@ -133,3 +140,6 @@ When the user provides a starting script or prompt:
 - **Count():** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/BasicAggregationFunctions/Count.htm
 - **Round():** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/NumericFunctions/round.htm
 - **NoConcatenate / automatic concatenation:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/ScriptPrefixes/NoConcatenate.htm
+- **FirstSortedValue() (NULL on tied ranks):** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/BasicAggregationFunctions/FirstSortedValue.htm
+- **TRACE:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/ScriptControlStatements/Trace.htm
+- **Include / Must_Include:** https://help.qlik.com/en-US/cloud-services/Subsystems/Hub/Content/Sense_Hub/Scripting/ScriptRegularStatements/Include.htm

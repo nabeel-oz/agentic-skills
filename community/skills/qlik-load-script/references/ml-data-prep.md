@@ -1,6 +1,6 @@
 # ML Data Preparation for Qlik Predict — Guidelines, Template & Example
 
-Read this when the task is preparing a dataset for a Qlik Predict experiment. For syntax, pitfalls and code patterns, see [syntax-and-patterns.md](syntax-and-patterns.md) — read that one regardless of task type.
+Read this when the task is preparing a dataset for a Qlik Predict experiment. Regardless of task type, also read [writing-scripts.md](writing-scripts.md) before the first `LOAD`, [syntax-and-patterns.md](syntax-and-patterns.md) while writing, and [verification-checklist.md](verification-checklist.md) once the script is written.
 
 ## Table of Contents
 1. Common data sources
@@ -206,11 +206,14 @@ RESIDENT FinalFeatures;
 
 DROP TABLE FinalFeatures;
 
+LET vSourceRows = NoOfRows('WithSplit');
+
 // Store separately
 Training:
 NoConcatenate
 LOAD * RESIDENT WithSplit WHERE SplitFlag = 'Train';
 DROP FIELD SplitFlag FROM Training;
+LET vTrainRows = NoOfRows('Training');
 STORE Training INTO [lib://DataFiles/training_data.qvd] (qvd);
 DROP TABLE Training;
 
@@ -218,10 +221,15 @@ Testing:
 NoConcatenate
 LOAD * RESIDENT WithSplit WHERE SplitFlag = 'Test';
 DROP FIELD SplitFlag FROM Testing;
+LET vTestRows = NoOfRows('Testing');
 STORE Testing INTO [lib://DataFiles/testing_data.qvd] (qvd);
 DROP TABLE Testing;
 
 DROP TABLE WithSplit;
+
+// Counts must sum to the source — a mismatch means rows were lost in the split.
+LET vSplitTotal = $(vTrainRows) + $(vTestRows);
+TRACE >>> split: $(vTrainRows) train + $(vTestRows) test = $(vSplitTotal) of $(vSourceRows) source rows;
 ```
 
 **Approach 2 — Time-based split (when temporal ordering matters)**
@@ -250,6 +258,8 @@ DROP TABLE FinalFeatures;
 
 > **Why `NoConcatenate` here:** `Training` and `Testing` are filtered subsets of the same table, so their field sets are identical by construction — exactly the auto-concatenation trigger. Without the prefix, `Testing` would silently merge into `Training` and its `STORE`/`DROP` would fail. See [auto-concatenation](syntax-and-patterns.md#4-concatenate).
 
+> **Why trace the counts:** the split is the one place where rows can vanish without any error — a `WHERE` that matches neither branch, or a null `SplitFlag`. Since you cannot run the script, the trace is the user's first chance to see it. Apply the same convention to the time-based split. Note that each count is computed with `LET` **before** the table is dropped, then interpolated — `TRACE` does not evaluate expressions ([writing-scripts §3](writing-scripts.md#3-tracing-and-progress-output)).
+
 ---
 
 ## 8. Target leakage checklist
@@ -273,9 +283,11 @@ If the minority class is <20% of rows, flag this in a comment and suggest:
 
 ## 10. Final cleanup checklist
 Before outputting the final script:
-- [ ] The five non-negotiable syntax rules in SKILL.md and the [§14 self-check](syntax-and-patterns.md#14-sql-habits-that-break-in-qlik) have been walked through against the actual script text.
+- [ ] The [self-check](verification-checklist.md#self-check-before-returning-any-script) has been walked through against the actual script text.
 - [ ] Every table name referenced by `RESIDENT`/`STORE`/`DROP`/`JOIN` was actually created under that name (no auto-concatenation), and still exists at that point.
-- [ ] All temporary/intermediate tables are `DROP`ped.
+- [ ] All temporary/intermediate tables are `DROP`ped, each at the point it stops being needed rather than in a block at the end.
+- [ ] **Field lineage holds:** every field in the final matrix — and every field feeding a derivation, `WHERE`, `GROUP BY` or join key — is named or covered by `*` at each intermediate step. Nothing needed downstream was dropped by an explicit intermediate LOAD.
+- [ ] **Row counts are traced** after each `STORE` and after the split, with each count assigned by `LET` first and only `$(vVar)` inside the `TRACE`.
 - [ ] ID/key fields are retained for linking predictions back to source data. Only drop temporary helper columns.
 - [ ] The final feature matrix is an **explicit** LOAD — every field named, logically grouped, each non-obvious field commented ([§6a](#6a-the-final-feature-matrix-must-be-an-explicit-load)). No `LOAD *` in the final assembly.
 - [ ] A **Feature Definitions QVD** is produced ([§6b](#6b-feature-definitions-qvd)) — one row per field in the matrix, same order and grouping, descriptions in plain business English with no ML jargon.
@@ -366,7 +378,8 @@ LET vToday = Today();
 > "I have `lib://DataFiles/transactions.qvd` (one row per transaction: `CustomerID`, `TransactionDate`, `Amount`, `ProductCategory`, `Returned`) and `lib://DataFiles/customers.qvd` (one row per customer: `CustomerID`, `SignupDate`, `Region`). Build an ML prep script that predicts whether a customer cancels (`CancellationDate` is populated) in the next 90 days. Output training/testing QVDs."
 
 **Expected response:**
-1. State back the task: target = binary flag derived from `CancellationDate` (leaky field to drop after deriving the target), grain = one row per customer, source = the two QVDs above.
-2. Write a script (following the [script template](#11-script-template)) that: loads both QVDs, aggregates `transactions` to customer grain (`TxnCount` via `Count(1)`, `TotalSpend`, `AvgSpend`, `Recency_Days`, `Count(DISTINCT ProductCategory)`, return rate — see [Feature Engineering Patterns](syntax-and-patterns.md#13-feature-engineering-patterns)), joins onto `customers`, derives `Churn_Flag` from `CancellationDate` then drops `CancellationDate` itself (leakage), applies the random 80/20 split from [§7](#7-traintest-split-approaches), and stores `training_data.qvd` / `testing_data.qvd`. The final assembly is an explicit, grouped, commented field list per [§6a](#6a-the-final-feature-matrix-must-be-an-explicit-load) — not `LOAD *` — followed by a Feature Definitions INLINE table stored to `feature_definitions.qvd` ([§6b](#6b-feature-definitions-qvd)), describing each field in plain business language for the Qlik Sense app that will surface the predictions.
-3. Note the ratio features (return rate, avg transaction value) must be derived in a **second** LOAD above the aggregation — the aggregate aliases are out of scope in the LOAD that creates them. See [aggregate, then derive](syntax-and-patterns.md#13-feature-engineering-patterns).
-4. Flag any uncertain function calls with `// TODO: verify`, and call out the leakage check (`CancellationDate` removed) explicitly after the script.
+1. State back the task: target = binary flag derived from `CancellationDate` (leaky field to drop after deriving the target), grain = one row per customer, source = the two QVDs above. Sketch the final field list **before** writing any LOAD, and note that `SignupDate` and `CancellationDate` must survive the intermediate steps even though neither appears in the matrix — one feeds tenure, the other the target.
+2. Write a script (following the [script template](#11-script-template)) that: loads both QVDs, aggregates `transactions` to customer grain (`TxnCount` via `Count(1)`, `TotalSpend`, `AvgSpend`, `Recency_Days`, `Count(DISTINCT ProductCategory)`, return rate — see [Feature Engineering Patterns](syntax-and-patterns.md#12-feature-engineering-patterns)), joins onto `customers`, derives `Churn_Flag` from `CancellationDate` then drops `CancellationDate` itself (leakage), applies the random 80/20 split from [§7](#7-traintest-split-approaches), and stores `training_data.qvd` / `testing_data.qvd`. The final assembly is an explicit, grouped, commented field list per [§6a](#6a-the-final-feature-matrix-must-be-an-explicit-load) — not `LOAD *` — followed by a Feature Definitions INLINE table stored to `feature_definitions.qvd` ([§6b](#6b-feature-definitions-qvd)), describing each field in plain business language for the Qlik Sense app that will surface the predictions.
+3. Note the ratio features (return rate, avg transaction value) must be derived in a **second** LOAD above the aggregation — the aggregate aliases are out of scope in the LOAD that creates them. See [aggregate, then derive](syntax-and-patterns.md#12-feature-engineering-patterns).
+4. Trace the row count after each `STORE` and after the split, assigning each count with `LET` first — the join from `transactions` to `customers` is the point where a duplicate key would fan out unnoticed.
+5. Flag any uncertain function calls with `// TODO: verify`, and call out the leakage check (`CancellationDate` removed) explicitly after the script.

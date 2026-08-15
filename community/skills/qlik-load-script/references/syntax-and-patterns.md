@@ -1,5 +1,7 @@
 # Qlik Load Script — Syntax & Patterns Reference
 
+Read this **while writing script** — it is the syntax and code-pattern reference. Two companion files cover the phases either side: [writing-scripts.md](writing-scripts.md) for the construction decisions made before the first `LOAD`, and [verification-checklist.md](verification-checklist.md) for the pitfalls table, SQL-habits table and self-check to run once the script is written.
+
 ## Table of Contents
 1. Statements and Structure
 2. LOAD Statement Patterns
@@ -12,9 +14,7 @@
 9. STORE to QVD
 10. QUALIFY / UNQUALIFY
 11. Mapping Tables
-12. Common Pitfalls
-13. Feature Engineering Patterns
-14. SQL Habits That Break in Qlik
+12. Feature Engineering Patterns
 
 ---
 
@@ -234,7 +234,7 @@ Note that the `WHERE` in the second form is a *row* filter on already-aggregated
 
 | Category | Functions |
 |---|---|
-| **Aggregation** | `Sum()`, `Count()`, `Avg()`, `Min()`, `Max()`, `Count(DISTINCT ...)`, `Only()`, `FirstSortedValue()`, `Median()`, `Stdev()` |
+| **Aggregation** | `Sum()`, `Count()`, `Avg()`, `Min()`, `Max()`, `Count(DISTINCT ...)`, `Only()`, `FirstSortedValue()` *(NULL on ties — see below)*, `Median()`, `Stdev()` |
 | **Conditional** | `If(condition, then, else)`, `Pick()`, `Match()`, `MixMatch()`, `WildMatch()` |
 | **String** | `Len()`, `Left()`, `Right()`, `Mid()`, `SubField()`, `Replace()`, `Upper()`, `Lower()`, `Trim()`, `PurgeChar()`, `KeepChar()`, `TextBetween()` |
 | **Date** | `Today()`, `Now()`, `Year()`, `Month()`, `Day()`, `WeekDay()`, `Week()`, `Date()`, `Date#()`, `Num()`, `Interval()`, `AddMonths()`, `YearStart()`, `MonthStart()` |
@@ -301,6 +301,79 @@ Num(Value, '#,##0.00') as ValueFormatted
 ```
 For ML features, prefer leaving values unrounded unless rounding is a deliberate feature choice (e.g. binning). Rounding a feature discards signal for no modelling benefit.
 
+### FirstSortedValue() — returns NULL on tied ranks
+
+`FirstSortedValue(expr, sortweight[, n])` returns the value of `expr` from the row with the lowest `sortweight` (use `-sortweight` for the highest). Per the Qlik docs, if **two or more rows share that rank, the function returns NULL.**
+
+It fails silently. There is no error, no warning — the field simply has nulls for exactly the entities where a tie occurred, and those nulls then propagate into every ratio, flag and aggregate built on top of it.
+
+Ties are the norm, not the exception. Any of these produces them routinely:
+- Dates stored to day precision — two transactions on the same day.
+- Equal amounts, prices, or scores.
+- Integer ranks, counts, or sequence numbers.
+- Any sort key with lower cardinality than the number of rows in the group.
+
+**Prefer a more robust construct.** In order of preference:
+
+1. **`Max()` / `Min()`** — when the value you want *is* the extremum, not a value attached to it. `Max(TransactionDate)` cannot tie with itself.
+2. **Aggregate, then join back** — for "the value on the row where X is highest". Deterministic, and built from primitives with no edge-case behaviour to remember.
+3. **`Window()` rank, then filter** — a ranked pass on a RESIDENT load with an explicit tiebreak sort key, then a second pass filtering to rank 1. Use when the ranking itself is worth keeping, or when you need the *n*th row rather than the first.
+4. **`FirstSortedValue(DISTINCT expr, sortweight)`** — only where the tied rows carry genuinely identical values of `expr`, so the tie is immaterial. `DISTINCT` collapses duplicate value/weight pairs and avoids the null; it does **not** help when the tied rows differ.
+
+Worked example — the product category of each customer's most recent transaction:
+
+```qlik
+// ✗ FRAGILE — NULL for every customer with two transactions on their latest date
+LatestCategory:
+LOAD
+    CustomerID,
+    FirstSortedValue(ProductCategory, -TransactionDate) as LatestCategory
+RESIDENT Transactions
+GROUP BY CustomerID;
+```
+
+```qlik
+// ✓ ROBUST — aggregate to the key, then join back
+// Ties on TransactionDate are broken by TransactionID, so exactly one row wins.
+
+// 1. Each customer's latest transaction date.
+LatestTxnKey:
+LOAD
+    CustomerID,
+    Max(TransactionDate) as TransactionDate
+RESIDENT Transactions
+GROUP BY CustomerID;
+
+// 2. Keep only the transactions on that date — still multiple rows where a
+//    customer transacted twice on their latest day.
+INNER JOIN (LatestTxnKey)
+LOAD
+    CustomerID,
+    TransactionDate,
+    TransactionID
+RESIDENT Transactions;
+
+// 3. Break the tie explicitly: the highest TransactionID wins.
+LatestTxn:
+NoConcatenate
+LOAD
+    CustomerID,
+    Max(TransactionID) as TransactionID
+RESIDENT LatestTxnKey
+GROUP BY CustomerID;
+
+DROP TABLE LatestTxnKey;
+
+// 4. TransactionID is unique, so this join cannot fan out.
+LEFT JOIN (LatestTxn)
+LOAD
+    TransactionID,
+    ProductCategory as LatestCategory
+RESIDENT Transactions;
+```
+
+> The second pass is doing the work `FirstSortedValue` hides: it names the tiebreak explicitly. If you cannot name a tiebreak for your data, you do not have a well-defined "first" value, and that is a design question rather than a function-choice one.
+
 ---
 
 ## 7. Variables and Dollar-Sign Expansion
@@ -365,29 +438,7 @@ RESIDENT RawData;
 
 ---
 
-## 12. Common Pitfalls
-
-| Pitfall | What happens | How to avoid |
-|---|---|---|
-| **Missing semicolons** | Parser error, often cryptic | Every statement ends with `;` |
-| **Auto-concatenation** | Table with a matching field set merges into the earlier table; **your label never exists**, so later `RESIDENT`/`DROP`/`STORE` fail | `NoConcatenate` on every LOAD whose field set could match an earlier table — see §4 |
-| **Alias used in the same LOAD** | A field created with `as` is out of scope for every other expression in that LOAD | Split into a preceding LOAD or a RESIDENT step — see §2 |
-| **`Count(*)`** | Syntax error — not Qlik | `Count(1)` for all rows, `Count(Field)` for non-null values |
-| **`HAVING`** | Syntax error — not Qlik | Aggregate, then filter with `WHERE` in a preceding/RESIDENT load — see §5 |
-| **`Round(x, 2)` for 2 dp** | Rounds to the nearest multiple of 2 | Step is an interval: `Round(x, 0.01)` — see §6 |
-| **Join key mismatch** | JOIN matches on ALL shared field names, not just the one you intend | Rename unintended shared fields before joining |
-| **GROUP BY mismatch** | Non-aggregated fields missing from GROUP BY cause errors | List every non-aggregated field in GROUP BY |
-| **Dual values confusion** | A field can have both a text and numeric representation (dual). Aggregations on text-stored numbers fail silently | Use `Num()`, `Num#()`, or `Text()` to enforce type |
-| **Null vs empty string** | `IsNull()` only catches true nulls, not empty strings. `Len(Field)=0` catches empty strings | Use `If(Len(Trim(Field))=0 or IsNull(Field), ...)` for both |
-| **RESIDENT after DROP** | Referencing a table you already dropped | Track table lifecycle carefully |
-| **Preceding LOAD field visibility** | Outer (preceding) LOAD can only see fields from the inner LOAD, not from other tables | When in doubt, use RESIDENT instead |
-| **Dollar-sign expansion timing** | `$(vVar)` evaluates at parse time, not row-by-row | For row-level logic use `Peek()` or field references, not variables |
-| **Date interpretation** | Dates loaded from CSV may be strings, not Qlik serial dates | Use `Date#(Field, 'format')` to parse, then format as YYYY-MM-DD: `Date(Date#(Field, 'DD/MM/YYYY'), 'YYYY-MM-DD')` |
-| **Window() misuse** | Forgetting partition or sort fields gives nonsensical results | Always specify partition and sort. Test with small data |
-
----
-
-## 13. Feature Engineering Patterns
+## 12. Feature Engineering Patterns
 
 ### Aggregation to grain (transactional → one row per entity)
 ```qlik
@@ -516,50 +567,7 @@ RESIDENT MainTable;
 
 ---
 
-## 14. SQL Habits That Break in Qlik
+## Next: verify what you wrote
 
-Qlik load script *looks* like SQL, which is exactly why SQL reflexes slip through unnoticed. Everything in the left column is a syntax error or a silent wrong answer. Check any script you write against this list before returning it.
-
-| SQL habit | Status in Qlik | Qlik equivalent |
-|---|---|---|
-| `COUNT(*)` | Invalid | `Count(1)`, or `Count(Field)` for non-nulls |
-| `HAVING <agg> > n` | Invalid — no such clause | Aggregate, then `WHERE` in a preceding/RESIDENT load |
-| `ROUND(x, 2)` = 2 dp | Valid syntax, **wrong result** — rounds to multiples of 2 | `Round(x, 0.01)` |
-| Alias reused later in the same `SELECT` list | Invalid — alias is out of scope | Preceding LOAD or RESIDENT step |
-| `JOIN … ON a.k = b.k` | Invalid — no `ON` clause | Join is a prefix; keys are **all** identically-named fields. Rename to control |
-| `SELECT … FROM a, b` (multi-table FROM) | Invalid | One source per LOAD; combine via JOIN prefix or `CONCATENATE` |
-| `UNION` / `UNION ALL` | Invalid | `CONCATENATE (Target) LOAD …` (union all). For union-distinct, add `LOAD distinct` on a RESIDENT pass |
-| `CASE WHEN … THEN … END` | Invalid | `If(cond, then, else)`, nested; or `Pick(Match(…), …)` |
-| `COALESCE(a, b, c)` | Invalid | `Alt(a, b, c)` |
-| `ISNULL(x)` returning a value | `IsNull(x)` returns a boolean only | `Alt(x, default)` or `If(IsNull(x), default, x)` |
-| `SUBSTRING(s, 2, 3)` | Invalid | `Mid(s, 2, 3)` |
-| `LEN(s)` / `LENGTH(s)` | `Len(s)` ✓ | — |
-| `GETDATE()` / `CURRENT_DATE` | Invalid | `Today()` / `Now()` |
-| `DATEDIFF(d, a, b)` | Invalid | `b - a` (dates are numeric serials); or `Interval(b - a, 'D')` |
-| `x <> y` | Valid ✓ (`<>` is Qlik's not-equal) | — |
-| `AS` alias before the expression | Invalid | Expression first: `expr as Alias` |
-| Subquery in `FROM` / `WHERE` | Invalid — no subqueries | Materialise as a table first, or use a preceding LOAD |
-| `WITH` / CTEs | Invalid | Intermediate tables + `DROP TABLE` |
-| `DISTINCT` inside an aggregate | `Count(DISTINCT f)` ✓; `LOAD distinct` ✓ | — |
-| `LIMIT` / `TOP n` | Invalid | `FIRST n LOAD …` prefix |
-| `ORDER BY` on a `FROM`-file load | Only valid on `RESIDENT` loads | Load first, then re-load `RESIDENT … ORDER BY` |
-| Window functions `OVER (PARTITION BY … ORDER BY …)` | Invalid | `Window(agg, partition, sort_type, sort_expr, filter, start, end)` on a RESIDENT load |
-| `NULL` string comparisons (`x = NULL`) | Never true | `IsNull(x)`, and `Len(Trim(x)) = 0` for empties |
-| `+` for string concatenation | Numeric addition | `&` concatenates: `First & ' ' & Last` |
-| `%` for modulo | Invalid | `Mod(a, b)` |
-| `/` integer division | Always float | `Div(a, b)` for integer division |
-
-### Self-check before returning any script
-
-Work through this list against the script you just wrote — most of these are invisible at reload time until the specific line executes:
-
-1. **Every table reference resolves.** For each `RESIDENT`, `DROP TABLE`, `STORE`, `JOIN (…)`, `CONCATENATE (…)`, name the `LOAD` that created it, and confirm it wasn't auto-concatenated away (§4) or already dropped.
-2. **No alias is used in the LOAD that defines it** (§2). Scan each LOAD's field list for names that appear both as an `as` target and inside another expression.
-3. **No `Count(*)`, no `HAVING`, no `ON` clause, no subquery, no `CASE`** — see the table above.
-4. **Every `Round`/`Ceil`/`Floor` second argument** is an interval, and matches the intent.
-5. **Every `GROUP BY` lists all non-aggregated fields** in that LOAD, exactly.
-6. **Every aggregating LOAD has a `GROUP BY`** unless you genuinely want a single total row.
-7. **Every function used is one you can point to in the Qlik docs.** If not, replace it or flag with `// TODO: verify`.
-8. **Every non-file LOAD that could collide on field names carries `NoConcatenate`.**
-9. **Preceding LOAD stacks:** only the bottom statement has a source clause; only the top has the label and prefix; each intermediate ends with a bare `;`.
-10. **Every temporary table is dropped**, and nothing is referenced after its `DROP`.
+Run the pitfalls table, SQL-habits table, and numbered self-check in
+**[verification-checklist.md](verification-checklist.md)** after writing the script, and again after every revision.
